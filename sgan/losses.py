@@ -117,3 +117,29 @@ def final_displacement_error(
         return loss
     else:
         return torch.sum(loss)
+
+
+def theta_loss(pred_traj_fake,pred_traj_gt,last_obs_traj,loss_mask,consider_ped=None,mode='average'):
+    pred_len = pred_traj_fake.size(0)
+    batch = pred_traj_fake.size(1)
+
+    delta_fake = (pred_traj_fake[0,:,:]-last_obs_traj).view(1,batch,2)
+    delta_gt = (pred_traj_gt[0,:,:]-last_obs_traj).view(1,batch,2)
+    for step in range(1,pred_len):
+        delta_fake = torch.cat([delta_fake,(pred_traj_fake[step,:,:]-pred_traj_fake[step-1,:,:]).view(1,batch,2)],dim = 0)
+        delta_gt = torch.cat([delta_gt,(pred_traj_gt[step,:,:]-pred_traj_gt[step-1,:,:]).view(1,batch,2)],dim = 0)
+          
+    theta_fake = torch.atan2(delta_fake[:,:,1],delta_fake[:,:,0])
+    theta_gt = torch.atan2(delta_gt[:,:,1],delta_gt[:,:,0])
+    loss = torch.sum(torch.abs(theta_gt - theta_fake),dim=0)
+    if consider_ped is not None:
+        loss = loss*consider_ped
+    if mode == 'sum':
+        return torch.sum(loss)
+    elif mode == 'average':
+        return torch.sum(loss) / torch.numel(loss_mask.data)
+    elif mode == 'final':
+        return loss[-1]
+    elif mode == 'raw':
+        return loss
+

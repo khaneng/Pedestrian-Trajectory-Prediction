@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
     layers = []
     for dim_in, dim_out in zip(dim_list[:-1], dim_list[1:]):
@@ -19,9 +21,11 @@ def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
 
 def get_noise(shape, noise_type):
     if noise_type == 'gaussian':
-        return torch.randn(*shape).cuda()
+        # return torch.randn(*shape)
+        return torch.randn(*shape).to(device)
     elif noise_type == 'uniform':
-        return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda()
+        return torch.rand(*shape).sub_(0.5).mul_(2.0).to(device)
+        # return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda()
     raise ValueError('Unrecognized noise type "%s"' % noise_type)
 
 
@@ -47,9 +51,13 @@ class Encoder(nn.Module):
 
     def init_hidden(self, batch):
         return (
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda(),
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda()
+            torch.zeros(self.num_layers, batch, self.h_dim).to(device),
+            torch.zeros(self.num_layers, batch, self.h_dim).to(device)
         )
+        # return (
+        #     torch.zeros(self.num_layers, batch, self.h_dim),
+        #     torch.zeros(self.num_layers, batch, self.h_dim)
+        # )
 
     def forward(self, obs_traj):
         """
@@ -59,14 +67,21 @@ class Encoder(nn.Module):
         - final_h: Tensor of shape (self.num_layers, batch, self.h_dim)
         """
         # Encode observed Trajectory
+        # print("In Encoder forward :")
+        # print(obs_traj.contiguous().view(-1, 2).shape)
         batch = obs_traj.size(1)
-        obs_traj_embedding = self.spatial_embedding(obs_traj.view(-1, 2))
+        # print("encoding",obs_traj)
+        obs_traj_embedding = self.spatial_embedding(obs_traj.contiguous().view(-1, 2))
+        # print(self.spatial_embedding.weight.data[0],self.spatial_embedding.bias.data[0])
+        # print("obs_traj_embedding ",obs_traj_embedding.shape,obs_traj_embedding)
         obs_traj_embedding = obs_traj_embedding.view(
             -1, batch, self.embedding_dim
         )
         state_tuple = self.init_hidden(batch)
         output, state = self.encoder(obs_traj_embedding, state_tuple)
+        # print("output, state shape",output.shape, state)
         final_h = state[0]
+        # print("final_h ",final_h)
         return final_h
 
 
@@ -88,6 +103,16 @@ class Decoder(nn.Module):
 
         self.decoder = nn.LSTM(
             embedding_dim, h_dim, num_layers, dropout=dropout
+        )
+
+        self.move_net = MovementHiddenNet(
+            embedding_dim=self.embedding_dim,
+            h_dim=self.h_dim,
+            mlp_dim=mlp_dim,
+            bottleneck_dim=bottleneck_dim,
+            activation=activation,
+            batch_norm=batch_norm,
+            dropout=dropout
         )
 
         if pool_every_timestep:
@@ -122,7 +147,7 @@ class Decoder(nn.Module):
         self.spatial_embedding = nn.Linear(2, embedding_dim)
         self.hidden2pos = nn.Linear(h_dim, 2)
 
-    def forward(self, last_pos, last_pos_rel, state_tuple, seq_start_end):
+    def forward(self, last_pos, last_pos_rel, state_tuple, seq_start_end, before_last_pos):
         """
         Inputs:
         - last_pos: Tensor of shape (batch, 2)
@@ -132,6 +157,7 @@ class Decoder(nn.Module):
         Output:
         - pred_traj: tensor of shape (self.seq_len, batch, 2)
         """
+        # print("In Decoder forward: ")
         batch = last_pos.size(0)
         pred_traj_fake_rel = []
         decoder_input = self.spatial_embedding(last_pos_rel)
@@ -141,10 +167,12 @@ class Decoder(nn.Module):
             output, state_tuple = self.decoder(decoder_input, state_tuple)
             rel_pos = self.hidden2pos(output.view(-1, self.h_dim))
             curr_pos = rel_pos + last_pos
+            before_curr_pos = rel_pos + before_last_pos
 
             if self.pool_every_timestep:
                 decoder_h = state_tuple[0]
-                pool_h = self.pool_net(decoder_h, seq_start_end, curr_pos)
+                move_h = self.move_net(decoder_h, seq_start_end, curr_pos, before_curr_pos)
+                pool_h = self.pool_net(move_h, seq_start_end, curr_pos)
                 decoder_h = torch.cat(
                     [decoder_h.view(-1, self.h_dim), pool_h], dim=1)
                 decoder_h = self.mlp(decoder_h)
@@ -160,6 +188,89 @@ class Decoder(nn.Module):
 
         pred_traj_fake_rel = torch.stack(pred_traj_fake_rel, dim=0)
         return pred_traj_fake_rel, state_tuple[0]
+
+class MovementHiddenNet(nn.Module):
+    """Pooling module as proposed in our paper"""
+    def __init__(
+        self, embedding_dim=64, h_dim=64, mlp_dim=1024, bottleneck_dim=1024,
+        activation='relu', batch_norm=True, dropout=0.0
+    ):
+        super(MovementHiddenNet, self).__init__()
+
+        self.mlp_dim = 1024
+        self.h_dim = h_dim
+        self.bottleneck_dim = bottleneck_dim
+        self.embedding_dim = embedding_dim
+
+        mlp_pre_dim = embedding_dim + h_dim
+        mlp_pre_pool_dims = [mlp_pre_dim, 512, bottleneck_dim]
+
+        self.spatial_embedding = nn.Linear(1, embedding_dim)
+        self.mlp_pre_pool = make_mlp(
+            mlp_pre_pool_dims,
+            activation=activation,
+            batch_norm=batch_norm,
+            dropout=dropout)
+
+    def repeat(self, tensor, num_reps):
+        """
+        Inputs:
+        -tensor: 2D tensor of any shape
+        -num_reps: Number of times to repeat each row
+        Outpus:
+        -repeat_tensor: Repeat each row such that: R1, R1, R2, R2
+        """
+        col_len = tensor.size(1)
+        tensor = tensor.unsqueeze(dim=1).repeat(1, num_reps, 1)
+        tensor = tensor.view(-1, col_len)
+        return tensor
+
+    def forward(self, h_states, seq_start_end, end_pos, before_end_pos):
+        """
+        Inputs:
+        - h_states: Tensor of shape (num_layers, batch, h_dim)
+        - seq_start_end: A list of tuples which delimit sequences within batch
+        - end_pos: Tensor of shape (batch, 2)
+        Output:
+        - move_h: Tensor of shape (batch, bottleneck_dim)
+        """
+        # print("in MovementHiddenNet forward: ")
+        move_h = []
+        for _, (start, end) in enumerate(seq_start_end):
+            start = start.item()
+            end = end.item()
+            num_ped = end - start
+            curr_hidden = h_states.view(-1, self.h_dim)[start:end]
+            curr_end_pos = end_pos[start:end]
+            before_curr_end_pos = before_end_pos[start:end]
+            # Repeat -> H1, H2, H1, H2
+            curr_hidden_1 = curr_hidden.repeat(num_ped, 1)
+            # Repeat position -> P1, P2, P1, P2
+            curr_end_pos_1 = curr_end_pos.repeat(num_ped, 1)
+            before_curr_end_pos_1 = before_curr_end_pos.repeat(num_ped, 1)
+
+            delta_y_1 = (curr_end_pos_1[:,1]-before_curr_end_pos_1[:,1])
+            delta_x_1 = (curr_end_pos_1[:,0]-before_curr_end_pos_1[:,0])
+            theta_1 = torch.atan2(delta_y_1,delta_x_1)
+            # Repeat position -> P1, P1, P2, P2
+            # for index,x in enumerate(delta_x_1):
+            #     if x == 0:
+            #         print("thetanan ",index)
+            curr_end_pos_2 = self.repeat(curr_end_pos, num_ped)
+            before_curr_end_pos_2 = self.repeat(before_curr_end_pos, num_ped)
+
+            delta_y_2 = (curr_end_pos_2[:,1]-before_curr_end_pos_2[:,1])
+            delta_x_2 = (curr_end_pos_2[:,0]-before_curr_end_pos_2[:,0])
+            theta_2 = torch.atan2(delta_y_2,delta_x_2)
+
+            curr_rel_theta = (theta_1 - theta_2).view(theta_1.size(0),1)
+            curr_rel_embedding = self.spatial_embedding(curr_rel_theta)
+            mlp_h_input = torch.cat([curr_rel_embedding, curr_hidden_1], dim=1)
+            curr_move_h = self.mlp_pre_pool(mlp_h_input)
+            curr_move_h = curr_move_h.view(num_ped, num_ped, -1).max(1)[0]
+            move_h.append(curr_move_h)
+        move_h = torch.cat(move_h, dim=0)
+        return move_h
 
 
 class PoolHiddenNet(nn.Module):
@@ -207,6 +318,7 @@ class PoolHiddenNet(nn.Module):
         Output:
         - pool_h: Tensor of shape (batch, bottleneck_dim)
         """
+        # print("in PoolHiddenNet forward: ")
         pool_h = []
         for _, (start, end) in enumerate(seq_start_end):
             start = start.item()
@@ -216,6 +328,7 @@ class PoolHiddenNet(nn.Module):
             curr_end_pos = end_pos[start:end]
             # Repeat -> H1, H2, H1, H2
             curr_hidden_1 = curr_hidden.repeat(num_ped, 1)
+            # print("curr_hidden ",curr_hidden.shape,curr_hidden_1.shape)
             # Repeat position -> P1, P2, P1, P2
             curr_end_pos_1 = curr_end_pos.repeat(num_ped, 1)
             # Repeat position -> P1, P1, P2, P2
@@ -294,6 +407,7 @@ class SocialPooling(nn.Module):
         Output:
         - pool_h: Tensor of shape (batch, h_dim)
         """
+        # print("In SocialPooling forward: ")
         pool_h = []
         for _, (start, end) in enumerate(seq_start_end):
             start = start.item()
@@ -403,6 +517,14 @@ class TrajectoryGenerator(nn.Module):
             neighborhood_size=neighborhood_size
         )
 
+        self.move_net = MovementHiddenNet(
+            embedding_dim=self.embedding_dim,
+            h_dim=encoder_h_dim,
+            mlp_dim=mlp_dim,
+            bottleneck_dim=bottleneck_dim,
+            activation=activation,
+            batch_norm=batch_norm)
+
         if pooling_type == 'pool_net':
             self.pool_net = PoolHiddenNet(
                 embedding_dim=self.embedding_dim,
@@ -421,7 +543,7 @@ class TrajectoryGenerator(nn.Module):
                 neighborhood_size=neighborhood_size,
                 grid_size=grid_size
             )
-
+        # print("noise_dim",noise_dim)
         if self.noise_dim[0] == 0:
             self.noise_dim = None
         else:
@@ -503,16 +625,19 @@ class TrajectoryGenerator(nn.Module):
         Output:
         - pred_traj_rel: Tensor of shape (self.pred_len, batch, 2)
         """
+        # print("In TrajectoryGenerator forward: ")
         batch = obs_traj_rel.size(1)
         # Encode seq
         final_encoder_h = self.encoder(obs_traj_rel)
         # Pool States
         if self.pooling_type:
             end_pos = obs_traj[-1, :, :]
+            before_end_pos = obs_traj[-2, :, :]
             pool_h = self.pool_net(final_encoder_h, seq_start_end, end_pos)
+            move_h = self.move_net(pool_h, seq_start_end, end_pos, before_end_pos)
             # Construct input hidden states for decoder
             mlp_decoder_context_input = torch.cat(
-                [final_encoder_h.view(-1, self.encoder_h_dim), pool_h], dim=1)
+                [final_encoder_h.view(-1, self.encoder_h_dim), move_h], dim=1)
         else:
             mlp_decoder_context_input = final_encoder_h.view(
                 -1, self.encoder_h_dim)
@@ -528,11 +653,16 @@ class TrajectoryGenerator(nn.Module):
 
         decoder_c = torch.zeros(
             self.num_layers, batch, self.decoder_h_dim
-        ).cuda()
+        ).to(device)
+        # decoder_c = torch.zeros(
+        #     self.num_layers, batch, self.decoder_h_dim
+        # )
+
 
         state_tuple = (decoder_h, decoder_c)
         last_pos = obs_traj[-1]
         last_pos_rel = obs_traj_rel[-1]
+        before_last_pos = obs_traj[-2]
         # Predict Trajectory
 
         decoder_out = self.decoder(
@@ -540,7 +670,9 @@ class TrajectoryGenerator(nn.Module):
             last_pos_rel,
             state_tuple,
             seq_start_end,
+            before_last_pos,
         )
+        
         pred_traj_fake_rel, final_decoder_h = decoder_out
 
         return pred_traj_fake_rel

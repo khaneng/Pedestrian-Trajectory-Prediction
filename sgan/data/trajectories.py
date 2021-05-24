@@ -106,11 +106,12 @@ class TrajectoryDataset(Dataset):
             data = read_file(path, delim)
             frames = np.unique(data[:, 0]).tolist()
             frame_data = []
+            print("total unique frames ",len(frames))
             for frame in frames:
                 frame_data.append(data[frame == data[:, 0], :])
             num_sequences = int(
                 math.ceil((len(frames) - self.seq_len + 1) / skip))
-
+            print("num_sequences",num_sequences)
             for idx in range(0, num_sequences * self.skip + 1, skip):
                 curr_seq_data = np.concatenate(
                     frame_data[idx:idx + self.seq_len], axis=0)
@@ -144,6 +145,7 @@ class TrajectoryDataset(Dataset):
                         poly_fit(curr_ped_seq, pred_len, threshold))
                     curr_loss_mask[_idx, pad_front:pad_end] = 1
                     num_peds_considered += 1
+                    
 
                 if num_peds_considered > min_ped:
                     non_linear_ped += _non_linear_ped
@@ -151,16 +153,16 @@ class TrajectoryDataset(Dataset):
                     loss_mask_list.append(curr_loss_mask[:num_peds_considered])
                     seq_list.append(curr_seq[:num_peds_considered])
                     seq_list_rel.append(curr_seq_rel[:num_peds_considered])
-
         self.num_seq = len(seq_list)
         seq_list = np.concatenate(seq_list, axis=0)
         seq_list_rel = np.concatenate(seq_list_rel, axis=0)
         loss_mask_list = np.concatenate(loss_mask_list, axis=0)
         non_linear_ped = np.asarray(non_linear_ped)
-
         # Convert numpy -> Torch Tensor
         self.obs_traj = torch.from_numpy(
             seq_list[:, :, :self.obs_len]).type(torch.float)
+        # print("seq_list ",seq_list.shape,seq_list)
+        # print(self.obs_traj.shape,self.obs_traj)
         self.pred_traj = torch.from_numpy(
             seq_list[:, :, self.obs_len:]).type(torch.float)
         self.obs_traj_rel = torch.from_numpy(
